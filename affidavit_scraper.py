@@ -560,10 +560,38 @@ class AffidavitScraper:
                 except Exception:
                     pass
 
-            # Find Download button
-            download_btn = await detail_page.query_selector(
-                "a:has-text('Download'), button:has-text('Download'), a[href*='affidavit-pdf']"
+            # Find the LATEST Download button — when multiple affidavits exist, pick highest ID
+            # Structure: <button onclick="return increaseDownloadCount(5629);">Download</button>
+            import re as _re2
+            all_download_btns = await detail_page.query_selector_all(
+                "a:has-text('Download'), button:has-text('Download')"
             )
+            download_btn = None
+            if len(all_download_btns) <= 1:
+                download_btn = all_download_btns[0] if all_download_btns else None
+            else:
+                # Multiple affidavits — pick the one with highest increaseDownloadCount ID
+                best_id = -1
+                for btn in all_download_btns:
+                    onclick = await btn.get_attribute("onclick") or ""
+                    if not onclick:
+                        # Check parent anchor
+                        parent_a = await btn.evaluate_handle("el => el.closest('a') || el")
+                        onclick = await parent_a.get_attribute("onclick") or ""
+                    # Also check inner button
+                    inner_btn = await btn.query_selector("button[onclick]")
+                    if inner_btn:
+                        onclick = await inner_btn.get_attribute("onclick") or onclick
+                    m = _re2.search(r'increaseDownloadCount\((\d+)\)', onclick)
+                    if m:
+                        affid = int(m.group(1))
+                        if affid > best_id:
+                            best_id = affid
+                            download_btn = btn
+                    elif download_btn is None:
+                        download_btn = btn
+                if best_id > 0:
+                    logger.info(f"  Multiple affidavits found — using latest (ID={best_id})")
             if not download_btn:
                 logger.warning(f"  No download button for {cand_name}")
                 return 0
