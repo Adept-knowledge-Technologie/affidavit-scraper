@@ -170,14 +170,20 @@ async def get_options(page: Page, selector: str) -> list[tuple[str, str]]:
 
 class AffidavitScraper:
 
-    def __init__(self, state_code: str, election_type: str, target_constituency: str = None,
+    def __init__(self, state_code: str, election_type: str, target_constituency=None,
                  upload: bool = False, filter_date: str = None, before_time: str = None):
         self.state_code = state_code
         self.election_type = election_type
-        self.target_constituency = target_constituency
+        # Accept single string or list
+        if isinstance(target_constituency, list):
+            self.target_constituencies = [c.upper() for c in target_constituency]
+        elif target_constituency:
+            self.target_constituencies = [target_constituency.upper()]
+        else:
+            self.target_constituencies = []
         self.upload = upload
-        self.filter_date = filter_date  # e.g. "01-04-2026"
-        self.before_time = before_time  # e.g. "16:00" — only download affidavits uploaded before this time
+        self.filter_date = filter_date
+        self.before_time = before_time
         self._upload_client = None  # optional filter
 
     async def run(self):
@@ -202,8 +208,29 @@ class AffidavitScraper:
 
         checkpoint = load_checkpoint()
         completed_constituencies = set(checkpoint.get("completed", []))
-        if completed_constituencies:
-            logger.info(f"Resuming — {len(completed_constituencies)} constituencies already done")
+        # Checkpoint only applies to full runs (no --constituency filter)
+        # For specific constituency runs, always start fresh
+        if self.target_constituencies:
+            completed_constituencies = set()
+            if checkpoint_file.exists():
+                checkpoint_file.unlink()
+        else:
+            # For full runs, only resume if checkpoint is recent (within 2 hours = same crash session)
+            checkpoint_age_hours = 999
+            if checkpoint_file.exists():
+                try:
+                    import time as _time
+                    age_seconds = _time.time() - checkpoint_file.stat().st_mtime
+                    checkpoint_age_hours = age_seconds / 3600
+                except Exception:
+                    pass
+            if checkpoint_age_hours > 2:
+                completed_constituencies = set()
+                if checkpoint_file.exists():
+                    checkpoint_file.unlink()
+                    logger.info("Starting fresh full run (previous checkpoint expired)")
+            elif completed_constituencies:
+                logger.info(f"Resuming from crash — {len(completed_constituencies)} constituencies already done")
         async with async_playwright() as p:
             browser, context = await make_browser(p)
             page = await context.new_page()
@@ -273,14 +300,17 @@ class AffidavitScraper:
                     logger.info(f"Phase {phase_name}: {len(const_opts)} constituencies")
 
                     for const_val, const_name in const_opts:
-                        if self.target_constituency and self.target_constituency.upper() not in const_name.upper():
+                        if self.target_constituencies and not any(
+                            t in const_name.upper() for t in self.target_constituencies
+                        ):
                             continue
                         # Skip already completed constituencies (resume support)
                         if const_name in completed_constituencies:
                             logger.info(f"  Skipping {const_name} — already completed")
                             # Still update report for skipped ones
                             tracker_file = DOWNLOAD_DIR / re.sub(r'[^\w\s-]', '', const_name).strip().replace(' ', '_') / ".downloaded.json"
-                            total_dl = len(load_tracker(tracker_file))
+                            raw = load_tracker(tracker_file)
+                            total_dl = sum(1 for k in raw if "|" not in str(k))
                             update_daily_report(self.filter_date, const_name, 0, total_dl)
                             continue
                         downloaded_this_run = await self._process_constituency(page, context, phase_val, const_val, const_name)
@@ -288,15 +318,17 @@ class AffidavitScraper:
                         completed_constituencies.add(const_name)
                         save_checkpoint(list(completed_constituencies), const_name)
                         logger.info(f"  ✓ Checkpoint saved ({len(completed_constituencies)} done)")
-                        # Update daily Excel report
+                        # Update daily Excel report — count only candidateid entries (not version_key entries)
                         tracker_file = DOWNLOAD_DIR / re.sub(r'[^\w\s-]', '', const_name).strip().replace(' ', '_') / ".downloaded.json"
-                        total_dl = len(load_tracker(tracker_file))
+                        raw = load_tracker(tracker_file)
+                        # candidateid entries are plain numbers or short strings without "|"
+                        total_dl = sum(1 for k in raw if "|" not in str(k))
                         update_daily_report(self.filter_date, const_name, downloaded_this_run, total_dl)
 
             finally:
                 await browser.close()
         # Clear checkpoint on successful completion
-        if checkpoint_file.exists() and not self.target_constituency:
+        if checkpoint_file.exists() and not self.target_constituencies:
             checkpoint_file.unlink()
             logger.info("All constituencies completed — checkpoint cleared")
 
@@ -608,7 +640,7 @@ async def main():
     parser = argparse.ArgumentParser(description="ECI Candidate Affidavit Scraper")
     parser.add_argument("--state", default="S22", help="State code (S22=Tamil Nadu)")
     parser.add_argument("--election", default="32-AC-GENERAL-3-60", help="Election type value")
-    parser.add_argument("--constituency", default=None, help="Filter to one constituency name")
+    parser.add_argument("--constituency", default=None, nargs="+", help="Filter to one or more constituency names e.g. PERAMBUR ALANDUR")
     parser.add_argument("--upload", action="store_true", help="Upload PDFs to Control Plane API after download")
     parser.add_argument("--date", default=None, help="Only download candidates uploaded on this date e.g. 01-04-2026")
     parser.add_argument("--before-time", default=None, dest="before_time", help="Only download affidavits uploaded before this time e.g. 16:00")
@@ -629,6 +661,8 @@ async def main():
         filter_date=args.date,
         before_time=args.before_time,
     )
+    if args.constituency:
+        logger.info(f"Filtering to constituencies: {args.constituency}")
     await scraper.run()
     logger.info("Done.")
 
